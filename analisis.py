@@ -128,4 +128,5 @@ print(f"Antena: en la banda el S11 va de {banda.s11.min():.1f} a {banda.s11.max(
 # ---------------- 8. Recomendación para la ANE
 print("\nRecomendación:")
 for _, fila in resumen.iterrows():
-    print(f"Canal {fila.canal}: ocupado en el {fila.pct_ocupado}% de la ruta -> {fila.recomendacion}")
+    print(f"Canal {fila.canal}: ocupado en el {fila.pct_ocupado}% de la ruta, "
+          f"{fila.pct_bins}% de sus frecuencias > -60 dBm -> {fila.recomendacion}")

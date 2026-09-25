@@ -10,10 +10,11 @@ import pandas as pd
 UMBRAL = -60  # dBm: por encima de esto se considera ocupado
 
 
-def potencia_media(dbm):
-    # Parseval: la potencia media es el promedio en mW (no se puede promediar en dB)
+def potencia_canal(dbm):
+    # Sumatoria de Parseval: la potencia del canal es la suma de la potencia de sus bins, en mW
+    # (no se puede sumar en dB). El equipo guarda |FFT/N|, así que la suma da la potencia media de la señal.
     mw = 10 ** (dbm / 10)
-    return 10 * np.log10(mw.mean(axis=1))
+    return 10 * np.log10(mw.sum(axis=1))
 
 
 # ---------------- 1. Leer los archivos
@@ -38,12 +39,19 @@ gps_malo = (info.lat == 0) | (info.error_gps > 5)
 print("Medidas con GPS malo:")
 print(info.loc[gps_malo, ["archivo", "lat", "lon", "error_gps"]])
 
-# Nivel general de cada medida = mediana de su espectro.
-# 016 es mucho más alto que las demás, pero su espectro tiene la misma forma que el de
-# sus vecinas: estaba cerca de una antena, no es un error del equipo. Se deja.
+# Nivel general de cada medida = mediana de su espectro; piso de ruido = percentil 10
 info["nivel"] = espectro.median(axis=1)
-print("Medidas con el nivel más alto:")
-print(info.sort_values("nivel").tail(3)[["archivo", "nivel"]])
+info["piso"] = espectro.quantile(0.1, axis=1)
+info["pico"] = espectro.max(axis=1)
+
+# Saturación: el equipo guarda 20·log10|FFT/N|, así que 0 dB es el máximo del conversor (ADC).
+# Un pico a menos de 6 dB de ese máximo satura el receptor. Además, su piso de ruido sube en toda la
+# banda, incluso en frecuencias vacías (una antena cercana solo subiría su propio canal).
+# La medida no representa el espectro: se conserva en el mapa, pero no entra en los indicadores.
+info["saturada"] = info.pico > -6
+print("Medidas saturadas (pico cerca de 0 dB):")
+print(info.loc[info.saturada, ["archivo", "pico", "piso"]])
+print(f"Piso de ruido típico: {info.piso.median():.1f} dB")
 
 # ---------------- 3. Corregir (imputar)
 # GPS: se borra la posición mala y se pone el punto medio entre la medida anterior y la siguiente
@@ -68,20 +76,24 @@ error = (prueba.loc[:, 300:306] - espectro.loc[:, 300:306]).abs().mean().mean()
 print(f"Error de la corrección: {error:.2f} dB")
 
 # ---------------- 4. Indicadores
-# Potencia media de cada canal (bloques de 5 MHz = 256 bins) en cada medida
+# Potencia de cada canal (bloques de 5 MHz = 256 bins) en cada medida
 canales = {"A": (0, 255), "B": (256, 511), "C": (512, 767), "D": (768, 1023)}
 for canal, (ini, fin) in canales.items():
-    info["p_" + canal] = potencia_media(espectro.loc[:, ini:fin])
+    info["p_" + canal] = potencia_canal(espectro.loc[:, ini:fin])
+
+# Los indicadores se calculan sin las medidas saturadas
+ok = ~info.saturada
+validas = espectro[ok]
 
 # Por frecuencia: en qué porcentaje de la ruta supera el umbral
 frec = pd.DataFrame()
 frec["freq_mhz"] = 840 + np.arange(1024) * 20 / 1024
 frec["canal"] = np.repeat(["A", "B", "C", "D"], 256)
-frec["mediana"] = espectro.median()
-frec["pct_ocupado"] = (espectro > UMBRAL).mean() * 100
+frec["mediana"] = validas.median()
+frec["pct_ocupado"] = (validas > UMBRAL).mean() * 100
 
 # La más contaminada es la que está ocupada en más puntos de la ruta.
-# (No se usa el promedio en mW entre medidas porque lo domina la medida 016.)
+# (No se usa el promedio en mW entre medidas porque lo dominan las medidas más fuertes.)
 mas = frec.pct_ocupado.idxmax()
 menos = frec.pct_ocupado.idxmin()
 info["p_frec_max"] = espectro[mas]
@@ -89,18 +101,24 @@ info["p_frec_max"] = espectro[mas]
 print("\n--- Indicadores ---")
 resumen = []
 for canal in canales:
-    tipica = info["p_" + canal].median()
-    ocupado = round((info["p_" + canal] > UMBRAL).mean() * 100, 1)
-    # Recomendación para la ANE según en qué parte de la ruta el canal está ocupado
-    if ocupado < 25:
+    tipica = info.loc[ok, "p_" + canal].median()
+    # Criterio del examen: el canal está ocupado donde su potencia supera -60 dBm (casi toda la ruta en los 4)
+    ocupado = round((info.loc[ok, "p_" + canal] > UMBRAL).mean() * 100, 1)
+    # Como los 4 salen ocupados, la recomendación compara qué parte del canal está libre:
+    # % de sus frecuencias (bins) por encima de -60 dBm, promediado en toda la ruta
+    bins = round(frec.pct_ocupado[frec.canal == canal].mean(), 1)
+    if bins < 25:
         decision = "se recomienda usar"
-    elif ocupado < 50:
+    elif bins < 50:
         decision = "usar con cuidado"
     else:
         decision = "no se recomienda"
-    resumen.append([canal, round(tipica, 1), ocupado, decision])
-resumen = pd.DataFrame(resumen, columns=["canal", "potencia_tipica", "pct_ocupado", "recomendacion"])
+    resumen.append([canal, round(tipica, 1), ocupado, bins, decision])
+resumen = pd.DataFrame(resumen, columns=["canal", "potencia_tipica", "pct_ocupado", "pct_bins", "recomendacion"])
 print(resumen)
+# Sensibilidad: cuánto cambiaría el % de frecuencias ocupadas si se dejaran las saturadas
+con_todas = [round(float((espectro.loc[:, i:f] > UMBRAL).mean().mean()) * 100, 1) for i, f in canales.values()]
+print("Con las medidas saturadas, % de frecuencias > -60 dBm (A, B, C, D):", con_todas)
 print(f"Frecuencia más contaminada: {frec.freq_mhz[mas]:.3f} MHz, ocupada en el {frec.pct_ocupado[mas]:.0f}% de la ruta")
 print(f"Frecuencia menos contaminada: {frec.freq_mhz[menos]:.3f} MHz, ocupada en el {frec.pct_ocupado[menos]:.0f}% de la ruta")
 

@@ -44,13 +44,15 @@ def mapa_de_calor(columna, vmin, vmax):
     # Cada píxel es el promedio de las medidas pesado por un kernel gaussiano de la distancia.
     # Solo se pinta cerca de la ruta: más lejos no hay medidas.
     # (folium.plugins.HeatMap suma los puntos que se enciman: mostraría densidad, no el valor.)
+    # Las medidas saturadas no entran en el espectro; su temperatura sí es válida.
+    datos = info if columna == "temp" else info[~info.saturada]
     margen = BORDE / M_LAT
     lats = np.linspace(info.lat.max() + margen, info.lat.min() - margen, 400)  # fila 0 = norte
     lons = np.linspace(info.lon.min() - margen, info.lon.max() + margen, 260)
     glon, glat = np.meshgrid(lons, lats)
-    d = np.hypot((glon[..., None] - info.lon.values) * M_LON, (glat[..., None] - info.lat.values) * M_LAT)
+    d = np.hypot((glon[..., None] - datos.lon.values) * M_LON, (glat[..., None] - datos.lat.values) * M_LAT)
     w = np.exp(-0.5 * (d / SUAVIZADO) ** 2)
-    z = (w * info[columna].values).sum(axis=-1) / (w.sum(axis=-1) + 1e-12)
+    z = (w * datos[columna].values).sum(axis=-1) / (w.sum(axis=-1) + 1e-12)
     t = np.clip((z - vmin) / (vmax - vmin), 0, 1)
     imagen = COLORES(t)
     # Transparencia:
@@ -82,13 +84,13 @@ def leyenda(titulo, vmin, vmax, unidad, clases):
 st.title("Ocupación del espectro 840-860 MHz, occidente de Medellín")
 
 # ---------------- Decisión para la ANE
-mas = resumen.loc[resumen.pct_ocupado.idxmax()]
-menos = resumen.loc[resumen.pct_ocupado.idxmin()]
+mas = resumen.loc[resumen.pct_bins.idxmax()]
+menos = resumen.loc[resumen.pct_bins.idxmin()]
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Canal más contaminado", f"{mas.canal} ({BANDAS[mas.canal]})")
-c1.caption(f"Ocupado en el {mas.pct_ocupado}% de la ruta · {mas.recomendacion}")
+c1.caption(f"{mas.pct_bins}% de sus frecuencias sobre −60 dBm · {mas.recomendacion}")
 c2.metric("Canal menos contaminado", f"{menos.canal} ({BANDAS[menos.canal]})")
-c2.caption(f"Ocupado en el {menos.pct_ocupado}% de la ruta · {menos.recomendacion}")
+c2.caption(f"{menos.pct_bins}% de sus frecuencias sobre −60 dBm · {menos.recomendacion}")
 c3.metric("Frecuencia más contaminada", f"{f_mas.freq_mhz:.3f} MHz")
 c3.caption(f"Canal {f_mas.canal} · supera −60 dBm en el {f_mas.pct_ocupado:.0f}% de la ruta")
 c4.metric("Frecuencia menos contaminada", f"{f_menos.freq_mhz:.3f} MHz")
@@ -98,12 +100,14 @@ st.subheader("Recomendación para la ANE")
 tabla = pd.DataFrame({
     "Canal": resumen.canal,
     "Banda": resumen.canal.map(BANDAS),
-    "Potencia media típica (dBm, Parseval)": resumen.potencia_tipica,
-    "% de la ruta ocupado (> −60 dBm)": resumen.pct_ocupado,
+    "Potencia típica del canal (dBm, suma de Parseval)": resumen.potencia_tipica,
+    "% de la ruta con el canal ocupado (> −60 dBm)": resumen.pct_ocupado,
+    "% de frecuencias del canal > −60 dBm": resumen.pct_bins,
     "Recomendación": resumen.recomendacion,
 })
 st.dataframe(tabla, hide_index=True)
-st.caption("Criterio: < 25 % de la ruta ocupado → usar · 25-50 % → con cuidado · > 50 % → no usar.")
+st.caption("Los 4 canales superan −60 dBm en casi toda la ruta. Para recomendar se compara qué parte de cada canal "
+           "está ocupada: < 25 % de sus frecuencias → usar · 25-50 % → con cuidado · > 50 % → no usar.")
 
 # ---------------- Mapa
 capa = st.sidebar.radio("Capa del mapa", ["Ubicación de las mediciones", "Ruta de las mediciones", *heatmaps])
@@ -114,10 +118,12 @@ if capa == "Ubicación de las mediciones":
     for _, m in info.iterrows():
         popup = (f"<b>{m.archivo}</b><br>Temp: {m.temp:.1f} °C<br>"
                  f"A: {m.p_A:.1f} · B: {m.p_B:.1f} · C: {m.p_C:.1f} · D: {m.p_D:.1f} dBm<br>"
-                 f"GPS imputado: {'sí' if m.gps_imputado else 'no'}")
-        color = "red" if m.gps_imputado else "blue"
+                 f"GPS imputado: {'sí' if m.gps_imputado else 'no'}<br>"
+                 f"Receptor saturado: {'sí (no entra en los indicadores)' if m.saturada else 'no'}")
+        color = "red" if m.gps_imputado else "orange" if m.saturada else "blue"
         folium.CircleMarker([m.lat, m.lon], radius=6, color=color, fill=True, popup=popup).add_to(mapa)
-    st.caption("Clic en un punto para ver sus datos. En rojo: 008 y 017, posición GPS imputada.")
+    st.caption("Clic en un punto para ver sus datos. En rojo: 008 y 017, posición GPS imputada. "
+               "En naranja: 016, receptor saturado (no entra en los indicadores ni en los mapas del espectro).")
 
 elif capa == "Ruta de las mediciones":
     folium.PolyLine(info[["lat", "lon"]].values, color="blue").add_to(mapa)
@@ -145,6 +151,10 @@ else:
     imagen, limites = mapa_de_calor(columna, vmin, vmax)
     folium.raster_layers.ImageOverlay(imagen, bounds=limites).add_to(mapa)
     for _, m in info.iterrows():  # medidas reales encima, con su valor exacto
+        if m.saturada and columna != "temp":
+            folium.CircleMarker([m.lat, m.lon], radius=4, color="orange", weight=2, fill=False,
+                                tooltip=f"{m.archivo}: receptor saturado, no se usa").add_to(mapa)
+            continue
         folium.CircleMarker([m.lat, m.lon], radius=2, color="#222222", weight=1, fill=True, fill_color="#222222",
                             fill_opacity=0.8, tooltip=f"{m.archivo}: {m[columna]:.1f} {unidad}").add_to(mapa)
     mapa.get_root().html.add_child(leyenda(capa.replace("Mapa de calor: ", "").upper(), vmin, vmax, unidad, clases))
