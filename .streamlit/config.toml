@@ -1,0 +1,21 @@
+# Tema "centro de monitoreo": oscuro, acento cian, cifras en monoespaciada
+[theme]
+base = "dark"
+primaryColor = "#22d3ee"
+backgroundColor = "#0a0f1a"
+secondaryBackgroundColor = "#111827"
+textColor = "#e5e7eb"
+borderColor = "#1f2937"
+showWidgetBorder = true
+baseRadius = "0.5rem"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+codeFont = "JetBrains Mono:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap"
+headingFontWeights = [700, 600, 600, 600, 600, 600]
+dataframeHeaderBackgroundColor = "#0f172a"
+
+[client]
+# quien abre la URL no ve el botón "Deploy" ni el menú de desarrollador
+toolbarMode = "viewer"
+
+[browser]
+gatherUsageStats = false
