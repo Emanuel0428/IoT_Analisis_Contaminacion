@@ -44,8 +44,7 @@ def mapa_de_calor(columna, vmin, vcentro, vmax):
     # Cada píxel es el promedio de las medidas pesado por un kernel gaussiano de la distancia.
     # Solo se pinta cerca de la ruta: más lejos no hay medidas.
     # (folium.plugins.HeatMap suma los puntos que se enciman: mostraría densidad, no el valor.)
-    # Las medidas saturadas no entran en el espectro; su temperatura sí es válida.
-    datos = info if columna == "temp" else info[~info.saturada]
+    datos = info
     margen = BORDE / M_LAT
     lats = np.linspace(info.lat.max() + margen, info.lat.min() - margen, 400)  # fila 0 = norte
     lons = np.linspace(info.lon.min() - margen, info.lon.max() + margen, 260)
@@ -154,10 +153,9 @@ def ficha(titulo, texto, imagen=None):
 
 
 # ---------------- Encabezado
-validas = int((~info.saturada).sum())
 st.html(f"""<div class='hero'><div class='overline'>Estudio técnico para la ANE · ocupación del espectro</div>
 <h1>Banda 840–860 MHz · occidente de Medellín</h1>
-<p>{len(info)} medidas con estación móvil · {largo_km:.1f} km de recorrido · {validas} medidas válidas para los indicadores ·
+<p>{len(info)} medidas con estación móvil · {largo_km:.1f} km de recorrido ·
 umbral de contaminación −60 dBm</p></div>""")
 
 seccion = st.segmented_control("Sección", ["Resumen", "Mapas", "Calidad de datos", "Metodología"],
@@ -193,8 +191,8 @@ elif seccion == "Mapas":
             popup = (f"<b>{m.archivo}</b><br>Temp: {m.temp:.1f} °C<br>"
                      f"A: {m.p_A:.1f} · B: {m.p_B:.1f} · C: {m.p_C:.1f} · D: {m.p_D:.1f} dBm<br>"
                      f"GPS imputado: {'sí' if m.gps_imputado else 'no'}<br>"
-                     f"Receptor saturado: {'sí (no entra en los indicadores)' if m.saturada else 'no'}")
-            color = "#d95926" if m.gps_imputado else "#e66767" if m.saturada else "#3987e5"
+                     f"Junto a una antena: {'sí' if m.antena else 'no'}")
+            color = "#d95926" if m.gps_imputado else "#e66767" if m.antena else "#3987e5"
             folium.CircleMarker([m.lat, m.lon], radius=6, color=color, fill=True, fill_opacity=0.9,
                                 popup=popup).add_to(mapa)
         with col_ficha:
@@ -203,7 +201,7 @@ elif seccion == "Mapas":
             st.html("<div class='panel'>"
                     "<p><span class='marca' style='background:#3987e5'></span>Medida normal</p>"
                     f"<p><span class='marca' style='background:#d95926'></span>Posición GPS imputada ({int(info.gps_imputado.sum())})</p>"
-                    f"<p style='margin:0'><span class='marca' style='background:#e66767'></span>Receptor saturado ({int(info.saturada.sum())})</p></div>")
+                    f"<p style='margin:0'><span class='marca' style='background:#e66767'></span>Junto a una antena ({int(info.antena.sum())})</p></div>")
 
     elif capa == "Ruta":
         folium.PolyLine(info[["lat", "lon"]].values, color="#22d3ee", weight=4).add_to(mapa)
@@ -241,10 +239,6 @@ elif seccion == "Mapas":
         imagen, limites = mapa_de_calor(columna, vmin, vcentro, vmax)
         folium.raster_layers.ImageOverlay(imagen, bounds=limites).add_to(mapa)
         for _, m in info.iterrows():  # medidas reales encima, con su valor exacto
-            if m.saturada and columna != "temp":
-                folium.CircleMarker([m.lat, m.lon], radius=4, color="orange", weight=2, fill=False,
-                                    tooltip=f"{m.archivo}: receptor saturado, no se usa").add_to(mapa)
-                continue
             folium.CircleMarker([m.lat, m.lon], radius=2, color="#222222", weight=1, fill=True, fill_color="#222222",
                                 fill_opacity=0.8, tooltip=f"{m.archivo}: {m[columna]:.1f} {unidad}").add_to(mapa)
         mapa.get_root().html.add_child(leyenda(capa.upper(), vmin, vcentro, vmax, unidad, clases))
@@ -276,7 +270,7 @@ elif seccion == "Mapas":
         if capa not in ("Ubicación", "Ruta"):
             st.caption("Puntos: medidas reales (pasa el mouse para ver el valor). Entre ellas el color se interpola; "
                        "lo cercano al centro de la escala casi no se pinta."
-                       + ("" if capa == "Temperatura" else " En naranja, 016: receptor saturado."))
+                       + ("" if capa == "Temperatura" else " El valor más alto, en 016, es porque ahí hay una antena."))
 
 # ---------------- Calidad de datos
 elif seccion == "Calidad de datos":
@@ -284,7 +278,7 @@ elif seccion == "Calidad de datos":
     kpis([("Medidas de la ruta", f"{len(info)}", "001 a 061 · 1029 columnas, sin vacíos"),
           ("Archivos descartados", "2", "pruebas del equipo, no son de la ruta"),
           ("Posiciones GPS imputadas", f"{int(info.gps_imputado.sum())}", "interpolación entre vecinas"),
-          ("Medidas saturadas", f"{int(info.saturada.sum())}", "fuera de los indicadores"),
+          ("Junto a una antena", f"{int(info.antena.sum())}", "se conservan en los indicadores"),
           ("Celdas del pico DC", f"{celdas_dc}", f"{celdas_dc / (len(info) * 1024) * 100:.2f} % del espectro")])
 
     motivos = []
@@ -292,9 +286,9 @@ elif seccion == "Calidad de datos":
         if m.gps_imputado:
             problema = "GPS sin posición (lat/lon = 0)" if m.error_gps < 5 else f"GPS impreciso (HDOP {m.error_gps:.1f})"
             motivos.append([m.archivo, problema, "posición interpolada entre la medida anterior y la siguiente"])
-        if m.saturada:
-            motivos.append([m.archivo, f"receptor saturado (pico {m.pico:.1f} dB, piso {m.piso:.1f} dB)",
-                            "se conserva en el mapa, no entra en los indicadores"])
+        if m.antena:
+            motivos.append([m.archivo, f"valor muy alto (pico {m.pico:.1f} dB, piso {m.piso:.1f} dB): hay una antena",
+                            "se conserva, entra en los indicadores"])
     motivos += [["medidaprueba.txt", "prueba estática, GPS = 0", "descartado"],
                 ["medidapureba2.txt", "prueba del equipo fuera de la ruta", "descartado"]]
     st.subheader("Medidas con correcciones")
@@ -343,8 +337,8 @@ else:
         st.write("- Se descartan los 2 archivos de prueba.\n"
                  "- **GPS:** 008 (sin posición) y 017 (HDOP 17.3) se interpolan entre sus vecinas.\n"
                  "- **Pico DC:** bins 509–515 interpolados en frecuencia.\n"
-                 "- **016:** pico a −3.6 dB del máximo del conversor y piso de ruido 35 dB por encima de lo normal: "
-                 "receptor saturado. No entra en los indicadores.")
+                 "- **016:** pico a −3.6 dB del máximo del conversor y piso de ruido 35 dB por encima de lo normal. "
+                 "Ahí hay una antena: la medida es real y se conserva en los indicadores.")
         st.subheader("Limitaciones")
         st.write("- Una sola pasada: 61 puntos, sin hora, así que no se ve la variación en el día.\n"
                  "- Los niveles son relativos al conversor (dBFS), sin calibración absoluta.\n"

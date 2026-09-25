@@ -58,7 +58,6 @@ frec = pd.read_csv("data/indicadores_frecuencia.csv")
 resumen = pd.read_csv("data/indicadores_canal.csv")
 mas = frec.pct_ocupado.idxmax()
 menos = frec.pct_ocupado.idxmin()
-validas = info[~info.saturada]
 
 # ---------------- 1. Espectro de toda la ruta
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6.5), sharex=True, gridspec_kw={"hspace": 0.3})
@@ -90,9 +89,9 @@ for i, color, texto in [(mas, LIMITE, "más contaminada"), (menos, AZUL, "menos 
     ax.plot(info.orden, y, "-o", color=color, markersize=3.5, label=f"{texto} ({frec.freq_mhz[i]:.3f} MHz)")
     ax.annotate(f"{frec.freq_mhz[i]:.3f} MHz", (info.orden.iloc[-1], y.iloc[-1]), xytext=(6, 0),
                 textcoords="offset points", fontsize=11.5, color=TINTA, va="center")
-for _, m in info[info.saturada].iterrows():  # la medida saturada se ve pero no cuenta
-    ax.annotate(f"{m.archivo[:3]}: receptor saturado\n(no entra en los indicadores)", (m.orden, espectro[str(mas)][m.name]),
-                xytext=(-150, 4), textcoords="offset points", fontsize=11, color=TINTA2, va="top",
+for _, m in info[info.antena].iterrows():  # se señala la medida junto a una antena
+    ax.annotate(f"{m.archivo[:3]}: junto a una antena", (m.orden, espectro[str(mas)][m.name]),
+                xytext=(-150, -6), textcoords="offset points", fontsize=11, color=TINTA2, va="top",
                 arrowprops={"arrowstyle": "-", "color": TINTA2, "linewidth": 0.8})
 ax.set_xlabel("Medida (orden del recorrido)")
 ax.set_ylabel("dBm")
@@ -104,7 +103,7 @@ fig.savefig("figs/frecuencias_extremas.png")
 fig, ax = plt.subplots(figsize=(8, 5.5))
 rng = np.random.default_rng(0)  # separación vertical fija de los puntos, para que no se tapen
 for fila, canal in enumerate(["D", "C", "B", "A"]):
-    p = validas["p_" + canal]
+    p = info["p_" + canal]
     ax.scatter(p, fila + rng.uniform(-0.18, 0.18, len(p)), s=22, color=COLOR_CANAL[canal],
                edgecolors=FONDO, linewidths=0.8, zorder=3)
     ax.plot([p.median()] * 2, [fila - 0.3, fila + 0.3], color=TINTA, linewidth=2, zorder=4)
@@ -127,9 +126,9 @@ ax.scatter(info.lon, info.lat, s=18, color=AZUL, edgecolors=FONDO, linewidths=0.
 imputados = info[info.gps_imputado]
 ax.scatter(imputados.lon, imputados.lat, s=70, facecolors="none", edgecolors=NARANJA, linewidths=1.6, zorder=3,
            label="posición GPS imputada")
-saturadas = info[info.saturada]
-ax.scatter(saturadas.lon, saturadas.lat, s=70, facecolors="none", edgecolors=LIMITE, linewidths=1.6, zorder=3,
-           label="receptor saturado")
+antenas = info[info.antena]
+ax.scatter(antenas.lon, antenas.lat, s=70, facecolors="none", edgecolors=LIMITE, linewidths=1.6, zorder=3,
+           label="junto a una antena")
 ax.plot(info.lon.iloc[0], info.lat.iloc[0], "^", color=VERDE, markersize=11, zorder=4, label="inicio (001)")
 ax.plot(info.lon.iloc[-1], info.lat.iloc[-1], "s", color=TINTA, markersize=8, zorder=4, label=f"fin ({info.archivo.iloc[-1][:3]})")
 for i in range(0, len(info), 10):
