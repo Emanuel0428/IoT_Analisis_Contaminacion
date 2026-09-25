@@ -1,5 +1,5 @@
-canal,potencia_tipica,pct_ocupado
-A,-68.1,24.6
-B,-64.1,32.8
-C,-45.8,85.2
-D,-66.5,29.5
+canal,potencia_tipica,pct_ocupado,recomendacion
+A,-68.1,24.6,se recomienda usar
+B,-64.1,32.8,usar con cuidado
+C,-45.8,85.2,no se recomienda
+D,-66.5,29.5,usar con cuidado

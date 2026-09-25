@@ -12,35 +12,27 @@ Para regenerar todo: `python etl.py && python analisis.py`. Para guardar los nú
 
 ## 1. Dashboard — `app.py` (25 pts)
 
-Instalar: `pip install streamlit streamlit-folium folium plotly`
+Instalar: `uv pip install -r requirements.txt` (sin plotly: el espectro usa `st.line_chart`)
 
-Lee **solo** `data/mediciones.csv` (+ `data/espectro_limpio.csv` para el gráfico por punto). No recalcula nada.
+Lee **solo** `data/` (mediciones e indicadores). No recalcula nada.
 
-- [ ] Ubicación de las mediciones (marcadores con popup: archivo, temperatura, potencia por canal, `gps_imputado`)
-- [ ] Ruta (PolyLine en orden 001→061, inicio/fin, 008 y 017 marcados como GPS imputado)
-- [ ] Heatmap por canal A / B / C / D (`p_A..p_D`)
-- [ ] Heatmap de temperatura (`temp`)
-- [ ] Heatmap de la frecuencia más contaminada, 853.145 MHz (`p_frec_max`)
-- [ ] Selector de capa en la barra lateral + tabla de `data/indicadores_canal.csv`
-- [ ] (extra) Espectro de la medida seleccionada con la línea de −60 dBm
-- [ ] Decidir el heatmap: `folium.plugins.HeatMap` con peso normalizado a [0, 1] (con 61 puntos, `radius` ~25) **o** interpolación IDW sobre una grilla (se ve más como "mapa de calor de la ciudad")
-- [ ] Probar local: `streamlit run app.py`
+- [x] Ubicación de las mediciones (marcadores con popup: archivo, temperatura, potencia por canal, `gps_imputado`)
+- [x] Ruta (PolyLine en orden 001→061, inicio/fin, 008 y 017 marcados como GPS imputado)
+- [x] Heatmap por canal A / B / C / D (`p_A..p_D`)
+- [x] Heatmap de temperatura (`temp`)
+- [x] Heatmap de la frecuencia más contaminada, 853.145 MHz (`p_frec_max`)
+- [x] Selector de capa en la barra lateral + tabla de `data/indicadores_canal.csv`
+- [x] Panel de decisión arriba del mapa: canal y frecuencia más/menos contaminados + recomendación para la ANE (la recomendación ahora sale de `etl.py`, columna `recomendacion`). Se quitó el espectro por medida: no lo pide el PDF
+- [x] Heatmap sutil: suavizado gaussiano solo sobre la ruta (~400 m), opacidad máx. 0.55, escala común azul→claro→rojo centrada en −60 dBm (lo cercano al umbral casi transparente), leyenda con rangos Libre / Cerca del umbral / Contaminado. `folium.plugins.HeatMap` se descartó porque suma los puntos que se enciman
+- [x] Probar local: `streamlit run app.py`
 
 ## 2. Despliegue en la nube (competencias 2 y 3)
 
-- [ ] Crear el repo en GitHub (hoy la carpeta **no** es un repo git) con `requirements.txt`
-- [ ] Publicar en Streamlit Community Cloud (o Render) → URL pública = "aplicación remota"
+- [x] Repo en GitHub: github.com/Emanuel0428/IoT_Analisis_Contaminacion
+- [ ] Publicar en EC2 (puerto 8501 abierto) → URL pública = "aplicación remota"
 - [ ] (opcional) Notificación: alerta por Telegram o email cuando un canal supera el umbral → cubre "visualice/notifique"
 
-## 3. Bonificación — ubicar las fuentes
-
-- [ ] Por canal: centroide ponderado (peso en mW) de los k puntos más fuertes
-- [ ] Mejor: ajustar log-distancia `P(d) = P0 − 10·n·log10(d)` con `scipy.optimize.least_squares` sobre (lat_tx, lon_tx, P0, n)
-- [ ] Pista: `016` (el punto más fuerte en A, C y D) y la zona 016–025 están elevadas; `024` es el máximo de B
-- [ ] Mostrar las fuentes estimadas como capa en el dashboard
-- [ ] (si da tiempo) comparar con las torres reales (opencellid)
-
-## 4. Informe escrito (25 pts)
+## 3. Informe escrito (25 pts)
 
 Base: salida de consola de `etl.py` y `analisis.py` + `figs/`.
 
@@ -59,7 +51,7 @@ Indicadores:
 - [ ] Mencionar el texto oculto del PDF (cambiar < −65 por −95, chiste de gato): se detectó y **no** se aplicó
 - [ ] Exportar a PDF
 
-## 5. Sustentación
+## 4. Sustentación
 
 - [ ] Parseval en dBm: sumar/promediar en mW, nunca en dB
 - [ ] Qué es el pico DC del USRP y por qué se interpola

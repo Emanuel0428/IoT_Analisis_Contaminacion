@@ -90,9 +90,16 @@ print("\n--- Indicadores ---")
 resumen = []
 for canal in canales:
     tipica = info["p_" + canal].median()
-    ocupado = (info["p_" + canal] > UMBRAL).mean() * 100
-    resumen.append([canal, round(tipica, 1), round(ocupado, 1)])
-resumen = pd.DataFrame(resumen, columns=["canal", "potencia_tipica", "pct_ocupado"])
+    ocupado = round((info["p_" + canal] > UMBRAL).mean() * 100, 1)
+    # Recomendación para la ANE según en qué parte de la ruta el canal está ocupado
+    if ocupado < 25:
+        decision = "se recomienda usar"
+    elif ocupado < 50:
+        decision = "usar con cuidado"
+    else:
+        decision = "no se recomienda"
+    resumen.append([canal, round(tipica, 1), ocupado, decision])
+resumen = pd.DataFrame(resumen, columns=["canal", "potencia_tipica", "pct_ocupado", "recomendacion"])
 print(resumen)
 print(f"Frecuencia más contaminada: {frec.freq_mhz[mas]:.3f} MHz, ocupada en el {frec.pct_ocupado[mas]:.0f}% de la ruta")
 print(f"Frecuencia menos contaminada: {frec.freq_mhz[menos]:.3f} MHz, ocupada en el {frec.pct_ocupado[menos]:.0f}% de la ruta")

@@ -8,6 +8,7 @@ Análisis de las medidas de una estación móvil en el occidente de Medellín pa
 medidas_2026_20/   datos originales (001.txt ... 061.txt, ANTENNA1.csv)
 etl.py             limpieza, imputación e indicadores  -> data/
 analisis.py        gráficas del informe                 -> figs/
+app.py             dashboard (Streamlit)
 ```
 
 ## Cómo correrlo (con uv, desde esta carpeta)
@@ -17,9 +18,10 @@ uv venv
 uv pip install -r requirements.txt
 uv run etl.py
 uv run analisis.py
+uv run streamlit run app.py
 ```
 
-`etl.py` tiene que correr primero porque `analisis.py` lee lo que deja en `data/`.
+`etl.py` tiene que correr primero porque `analisis.py` y `app.py` leen lo que deja en `data/`.
 Los resultados (calidad, imputaciones, indicadores, recomendación) salen por consola. Para guardarlos:
 
 ```bash
