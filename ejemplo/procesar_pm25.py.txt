@@ -1,0 +1,441 @@
+"""Diagnóstico de calidad e imputación de la base PM2.5 de SIATA.
+
+Uso:
+    python procesar_pm25.py                 # procesa y escribe todo en salidas/
+    python procesar_pm25.py --test          # autoprueba de la lógica de imputación
+    python procesar_pm25.py --json ruta.json --salidas otra_carpeta
+"""
+import argparse
+import json
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+CENTINELA = -9999          # SIATA marca el dato faltante con este valor
+LIMITE_FISICO = 500.0      # µg/m³: por encima es falla de sensor, no contaminación real
+LIMITE_INTERP = 6          # horas máximas que se rellenan por interpolación lineal
+
+RAIZ = Path(__file__).resolve().parent
+JSON_POR_DEFECTO = RAIZ.parent / "src" / "Datos_SIATA_Aire_pm25.json"
+
+
+# ---------------------------------------------------------------- 1. estructura
+def cargar(ruta):
+    """JSON anidado (estación -> datos) a tabla larga ordenada por estación y fecha."""
+    estaciones = json.loads(Path(ruta).read_text(encoding="utf-8"))
+    df = pd.json_normalize(
+        estaciones,
+        record_path="datos",
+        meta=["codigoSerial", "nombre", "nombreCorto", "latitud", "longitud"],
+    )
+    df["fecha"] = pd.to_datetime(df["fecha"])
+    df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+    df["calidad"] = pd.to_numeric(df["calidad"], errors="coerce")
+    return df.sort_values(["codigoSerial", "fecha"]).reset_index(drop=True)
+
+
+def describir_estructura(df, estaciones_crudas):
+    paso = df.loc[df.codigoSerial == df.codigoSerial.iloc[0], "fecha"].diff().mode()[0]
+    return {
+        "registros": len(df),
+        "estaciones": df.codigoSerial.nunique(),
+        "variable": ", ".join(sorted(df.variableConsulta.unique())),
+        "fecha_min": df.fecha.min(),
+        "fecha_max": df.fecha.max(),
+        "paso_temporal": paso,
+        "registros_por_estacion": df.groupby("codigoSerial").size().unique().tolist(),
+        "campos_estacion": sorted(k for k in estaciones_crudas[0] if k != "datos"),
+        "tipos": df.dtypes.astype(str).to_dict(),
+    }
+
+
+# ---------------------------------------------------------------- 2. diagnóstico
+def marcar_invalidos(df):
+    """Clasifica cada registro y deja en `valor_limpio` solo lo utilizable.
+
+    Precedencia (gana el ultimo): no_validado -> fuera_de_rango -> faltante,
+    para que un -9999 se reporte como faltante aunque ademas traiga la
+    bandera de calidad en mal estado.
+    """
+    v = df["valor"]
+    df["motivo"] = "valido"
+    # SIATA marca con calidad != 1.0 el dato que su propio control no valido.
+    # Descartarlo es mas estricto que quedarse solo con los -9999, pero es el
+    # criterio del proveedor: un dato no validado no es un dato.
+    df.loc[df["calidad"] != 1.0, "motivo"] = "no_validado"
+    df.loc[v > LIMITE_FISICO, "motivo"] = "fuera_de_rango"
+    df.loc[v < 0, "motivo"] = "faltante"          # incluye el centinela -9999
+    df.loc[v == CENTINELA, "motivo"] = "faltante"
+    df["valor_limpio"] = df["valor"].where(df["motivo"] == "valido")
+    return df
+
+
+def outliers_iqr(serie):
+    """Cerca de Tukey (1.5*IQR). Solo se reporta: los picos altos de PM2.5 suelen ser reales."""
+    q1, q3 = serie.quantile([0.25, 0.75])
+    iqr = q3 - q1
+    return (serie < q1 - 1.5 * iqr) | (serie > q3 + 1.5 * iqr)
+
+
+def racha_maxima(mascara):
+    """Longitud del hueco consecutivo más largo dentro de una máscara booleana."""
+    grupo = (~mascara).cumsum()[mascara]
+    return int(grupo.value_counts().max()) if mascara.any() else 0
+
+
+def diagnosticar(df):
+    filas = []
+    for cod, g in df.groupby("codigoSerial"):
+        # La racha relevante es la de huecos a rellenar, no solo la de -9999:
+        # un tramo largo marcado como no validado es igual de ciego.
+        sin_dato = g.valor_limpio.isna()
+        filas.append({
+            "codigoSerial": cod,
+            "estacion": g.nombreCorto.iloc[0],
+            "n": len(g),
+            "faltantes": int((g.motivo == "faltante").sum()),
+            "fuera_de_rango": int((g.motivo == "fuera_de_rango").sum()),
+            "no_validado": int((g.motivo == "no_validado").sum()),
+            "a_imputar": int(sin_dato.sum()),
+            "pct_a_imputar": round(100 * sin_dato.mean(), 2),
+            "racha_max_h": racha_maxima(sin_dato.reset_index(drop=True)),
+            "outliers_iqr": int(outliers_iqr(g.valor_limpio).sum()),
+            "media": round(g.valor_limpio.mean(), 2),
+            "mediana": round(g.valor_limpio.median(), 2),
+            "std": round(g.valor_limpio.std(), 2),
+            "min": g.valor_limpio.min(),
+            "max": g.valor_limpio.max(),
+            "p95": round(g.valor_limpio.quantile(0.95), 2),
+            "asimetria": round(g.valor_limpio.skew(), 2),
+        })
+    return pd.DataFrame(filas).sort_values("pct_a_imputar", ascending=False)
+
+
+# ---------------------------------------------------------------- 3. imputación
+def imputar_serie(s):
+    """Huecos cortos por interpolación lineal en el tiempo; largos por climatología mes×hora.
+
+    Devuelve (valores imputados, método aplicado a cada hora).
+    """
+    falta = s.isna()
+    metodo = pd.Series("observado", index=s.index)
+    metodo[falta] = "climatologia"             # se degrada a lineal más abajo
+
+    # largo del hueco al que pertenece cada faltante: solo los cortos se interpolan
+    largo = falta.groupby((~falta).cumsum()).transform("sum")
+    lineal = s.interpolate(method="time", limit_area="inside")
+    lineal = lineal.where(~falta | (largo <= LIMITE_INTERP))
+    metodo[falta & lineal.notna()] = "interpolacion_lineal"
+
+    # Climatología mes×hora. Si una estación se quedó sin ningún dato válido en
+    # un mes entero, esa celda sale NaN: se degrada a la mediana de la misma
+    # hora en todo el año y, en último caso, a la mediana de la estación.
+    clima = s.groupby([s.index.month, s.index.hour]).transform("median")
+    clima = clima.fillna(s.groupby(s.index.hour).transform("median"))
+    clima = clima.fillna(s.median())
+    final = lineal.fillna(clima)
+    metodo[final.isna()] = "sin_dato"          # solo si una estación no tuviera nada
+    return final, metodo
+
+
+def imputar(df):
+    valores, metodos = [], []
+    for _, g in df.groupby("codigoSerial", sort=False):
+        s = pd.Series(g.valor_limpio.values, index=pd.DatetimeIndex(g.fecha))
+        v, m = imputar_serie(s)
+        valores.append(pd.Series(v.values, index=g.index))
+        metodos.append(pd.Series(m.values, index=g.index))
+    df["valor_imputado"] = pd.concat(valores).sort_index()
+    df["metodo"] = pd.concat(metodos).sort_index()
+    return df
+
+
+def validar_imputacion(df, fraccion=0.05, semilla=7):
+    """Oculta datos buenos al azar, los imputa y mide el error contra el valor real."""
+    rng = np.random.RandomState(semilla)
+    err = []
+    for _, g in df.groupby("codigoSerial", sort=False):
+        s = pd.Series(g.valor_limpio.values, index=pd.DatetimeIndex(g.fecha))
+        obs = np.flatnonzero(s.notna().values)
+        oculto = rng.choice(obs, int(len(obs) * fraccion), replace=False)
+        prueba = s.copy()
+        prueba.iloc[oculto] = np.nan
+        estimado, _ = imputar_serie(prueba)
+        err.append(pd.DataFrame({
+            "real": s.iloc[oculto].values,
+            "estimado": estimado.iloc[oculto].values,
+        }))
+    e = pd.concat(err)
+    d = e.estimado - e.real
+    return {
+        "n_evaluados": len(e),
+        "MAE": round(d.abs().mean(), 2),
+        "RMSE": round(np.sqrt((d ** 2).mean()), 2),
+        "sesgo": round(d.mean(), 2),
+        "R2": round(np.corrcoef(e.real, e.estimado)[0, 1] ** 2, 3),
+    }
+
+
+# ---------------------------------------------------------------- 4. salidas
+def exportar_json(df, ruta):
+    """Escribe el JSON que consume app_calidad_aire.py.
+
+    Mismo esquema que el original (lista de estaciones con su arreglo `datos`)
+    mas `metodo` y `observado` por registro. `variableConsulta` va como
+    "PM2.5" porque es exactamente lo que filtra cargar_estaciones() en la app;
+    el original trae "pm25" y con ese valor la app cargaria cero estaciones.
+    """
+    estaciones = []
+    for cod, g in df.groupby("codigoSerial", sort=False):
+        estaciones.append({
+            "codigoSerial": cod,
+            "nombre": g.nombre.iloc[0],
+            "nombreCorto": g.nombreCorto.iloc[0],
+            "latitud": g.latitud.iloc[0],
+            "longitud": g.longitud.iloc[0],
+            "datos": [
+                {
+                    "fecha": f.strftime("%Y-%m-%d %H:%M:%S"),
+                    "valor": round(float(v), 3),
+                    "variableConsulta": "PM2.5",
+                    "metodo": m,
+                    "observado": m == "observado",
+                }
+                for f, v, m in zip(g.fecha, g.valor_imputado, g.metodo)
+            ],
+        })
+    Path(ruta).write_text(json.dumps(estaciones, ensure_ascii=False), encoding="utf-8")
+    return estaciones
+
+
+def graficar(df, diag, carpeta):
+    carpeta.mkdir(parents=True, exist_ok=True)
+
+    # zoom a la estación del hueco más largo: se ve qué rellenó cada método
+    peor = diag.loc[diag.racha_max_h.idxmax(), "codigoSerial"]
+    g = df[df.codigoSerial == peor].set_index("fecha")
+    huecos = g[g.metodo == "climatologia"].index
+    centro = huecos[len(huecos) // 2] if len(huecos) else g.index[len(g) // 2]
+    v = g.loc[centro - pd.Timedelta("7D"): centro + pd.Timedelta("7D")]
+
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.plot(v.index, v.valor_imputado, lw=0.9, color="0.75", label="serie imputada")
+    ax.plot(v.index, v.valor_limpio, lw=0.9, color="tab:blue", label="observado")
+    for met, color in [("interpolacion_lineal", "tab:green"), ("climatologia", "tab:red")]:
+        p = v[v.metodo == met]
+        ax.plot(p.index, p.valor_imputado, ".", ms=5, color=color, label=met)
+    ax.set(title="PM2.5 %s - ventana del hueco más largo (%d h)"
+                 % (g.nombreCorto.iloc[0], diag.racha_max_h.max()), ylabel="µg/m³")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(carpeta / "serie_estacion.png", dpi=110)
+    plt.close(fig)
+
+    # faltantes por estación
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.barh(diag.estacion, diag.pct_a_imputar, color="tab:red")
+    ax.set(xlabel="% de horas faltantes", title="Datos faltantes por estación")
+    fig.tight_layout()
+    fig.savefig(carpeta / "faltantes_por_estacion.png", dpi=110)
+    plt.close(fig)
+
+    # dispersión entre estaciones
+    fig, ax = plt.subplots(figsize=(12, 5))
+    orden = df.groupby("nombreCorto").valor_limpio.median().sort_values().index
+    ax.boxplot([df.loc[df.nombreCorto == e, "valor_limpio"].dropna() for e in orden],
+               labels=orden, showfliers=False)
+    ax.set(ylabel="µg/m³", title="Distribución de PM2.5 por estación (sin outliers gráficos)")
+    plt.xticks(rotation=90)
+    fig.tight_layout()
+    fig.savefig(carpeta / "boxplot_estaciones.png", dpi=110)
+    plt.close(fig)
+
+    # comportamiento tendencial: ciclo mensual y ciclo horario
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 4))
+    df.set_index("fecha").valor_imputado.resample("M").mean().plot(ax=a1, marker="o")
+    a1.set(title="Promedio mensual (todas las estaciones)", ylabel="µg/m³", xlabel="")
+    df.groupby(df.fecha.dt.hour).valor_imputado.mean().plot(ax=a2, marker="o")
+    a2.set(title="Ciclo horario promedio", xlabel="hora del día", ylabel="µg/m³")
+    fig.tight_layout()
+    fig.savefig(carpeta / "ciclos.png", dpi=110)
+    plt.close(fig)
+
+
+def tabla_md(df):
+    """Tabla markdown sin dependencias extra (evita tabulate)."""
+    cols = list(df.columns)
+    filas = ["| " + " | ".join(map(str, cols)) + " |",
+             "|" + "---|" * len(cols)]
+    for _, r in df.iterrows():
+        filas.append("| " + " | ".join(str(r[c]) for c in cols) + " |")
+    return "\n".join(filas)
+
+
+def escribir_reporte(ruta, est, diag, df, val):
+    m = df.metodo.value_counts()
+    desc = df.valor_limpio.describe()
+    mensual = df.set_index("fecha").valor_imputado.resample("M").mean().round(1)
+    horario = df.groupby(df.fecha.dt.hour).valor_imputado.mean().round(1)
+
+    t = ["# Diagnóstico de calidad e imputación - PM2.5 SIATA", "",
+         "## 1. Estructura de la información", "",
+         "JSON: lista de estaciones; cada una con metadatos "
+         "(`%s`) y un arreglo `datos` con registros horarios "
+         "(`variableConsulta`, `fecha`, `calidad`, `valor`)." % "`, `".join(est["campos_estacion"]), "",
+         "| Campo | Valor |", "|---|---|",
+         "| Registros | %d |" % est["registros"],
+         "| Estaciones | %d |" % est["estaciones"],
+         "| Variable | %s |" % est["variable"],
+         "| Periodo | %s a %s |" % (est["fecha_min"], est["fecha_max"]),
+         "| Paso temporal | %s |" % est["paso_temporal"],
+         "| Registros por estación | %s (rejilla horaria completa, sin huecos de fecha) |"
+         % est["registros_por_estacion"], "",
+         "Tipos: " + ", ".join("`%s`: %s" % kv for kv in est["tipos"].items()), "",
+         "## 2. Diagnóstico de calidad", "",
+         "- **Nulos explícitos (`None`): 0.** El faltante viene codificado con el "
+         "centinela `%d`, no como nulo; si se lee sin tratarlo, hunde todos los promedios." % CENTINELA,
+         "- **Faltantes duros: %d (%.2f%%)** de %d registros: %d marcados con el centinela "
+         "`%d` y %d con otros valores negativos (imposibles en una concentración)."
+         % ((df.motivo == "faltante").sum(), 100 * (df.motivo == "faltante").mean(), len(df),
+            (df.valor == CENTINELA).sum(), CENTINELA,
+            ((df.valor < 0) & (df.valor != CENTINELA)).sum()),
+         "- **Fuera de rango físico (> %g µg/m³): %d.** Picos de hasta %s µg/m³, "
+         "imposibles para PM2.5."
+         % (LIMITE_FISICO, (df.motivo == "fuera_de_rango").sum(), df.valor.max()),
+         "- **No validados por SIATA (`calidad` != 1.0): %d (%.2f%%)**, la bandera propia del "
+         "proveedor." % ((df.motivo == "no_validado").sum(),
+                         100 * (df.motivo == "no_validado").mean()),
+         "- **Total descartado y sometido a imputación: %d (%.2f%%)** = faltantes duros + fuera "
+         "de rango + no validados. Es la cifra que hay que citar: los tres grupos se tratan "
+         "igual, ninguno aporta un valor utilizable."
+         % ((df.motivo != "valido").sum(), 100 * (df.motivo != "valido").mean()),
+         "- **Outliers estadísticos (Tukey 1.5·IQR): %d (%.2f%%).** Se reportan pero **no** se "
+         "eliminan: en calidad del aire los valores altos son episodios reales de contaminación."
+         % (diag.outliers_iqr.sum(), 100 * diag.outliers_iqr.sum() / len(df)),
+         "- **Hueco consecutivo más largo: %d horas** (estación %s)."
+         % (diag.racha_max_h.max(), diag.loc[diag.racha_max_h.idxmax(), "estacion"]), "",
+         "### Descriptivos globales (solo datos válidos)", "",
+         "| Estadístico | Valor |", "|---|---|"]
+    t += ["| %s | %.2f |" % (k, v) for k, v in desc.items()]
+    t += ["| asimetría | %.2f |" % df.valor_limpio.skew(),
+          "| curtosis | %.2f |" % df.valor_limpio.kurt(), "",
+          "Distribución asimétrica a la derecha: la media supera a la mediana, así que la "
+          "mediana es el estadístico robusto para imputar.", "",
+          "### Por estación", "",
+          tabla_md(diag), "",
+          "## 3. Comportamiento tendencial", "",
+          "Promedio mensual (µg/m³):", "",
+          "| Mes | Valor |", "|---|---|"]
+    t += ["| %s | %.1f |" % (i.strftime("%Y-%m"), v) for i, v in mensual.items()]
+    t += ["", "Ciclo horario promedio (µg/m³):", "",
+          "| Hora | Valor |", "|---|---|"]
+    t += ["| %02d | %.1f |" % (i, v) for i, v in horario.items()]
+    t += ["", "Ciclo diario con un pico matutino marcado (~8-9 h, hora pico de tráfico con "
+          "capa de mezcla baja), mínimo en la tarde y un repunte menor en la noche. "
+          "Estacionalmente el máximo cae en febrero-marzo, la temporada de transición "
+          "y quemas del Valle de Aburrá.", "",
+          "## 4. Imputación", "",
+          "Estrategia en dos etapas por estación:", "",
+          "1. **Interpolación lineal en el tiempo** para huecos de hasta %d horas: el PM2.5 "
+          "horario es autocorrelacionado, un hueco corto se estima bien con sus vecinos." % LIMITE_INTERP,
+          "2. **Climatología mes × hora (mediana)** para huecos más largos y bordes: interpolar "
+          "linealmente 99 horas inventaría una recta sin sentido físico; la mediana del mismo "
+          "mes y la misma hora conserva el ciclo diario y estacional.", "",
+          "| Método | Registros | % |", "|---|---|---|"]
+    t += ["| %s | %d | %.2f |" % (k, v, 100 * v / len(df)) for k, v in m.items()]
+    t += ["", "### Validación (ocultando el %d%% de datos buenos al azar)" % 5, "",
+          "| Métrica | Valor |", "|---|---|"]
+    t += ["| %s | %s |" % (k, v) for k, v in val.items()]
+    t += ["", "MAE de %s µg/m³ frente a una media de %.1f µg/m³: el error de la imputación es "
+          "pequeño comparado con la variabilidad natural de la serie." % (val["MAE"], desc["mean"]), "",
+          "## 5. Archivos generados", "",
+          "- `pm25_imputado.csv`: base completa con `valor_limpio`, `valor_imputado` y `metodo`.",
+          "- `diagnostico_estaciones.csv`: tabla de calidad por estación.",
+          "- `graficas/`: serie observada vs imputada, faltantes por estación, boxplot, ciclos.", ""]
+    Path(ruta).write_text("\n".join(t), encoding="utf-8")
+
+
+# ---------------------------------------------------------------- autoprueba
+def autoprueba():
+    idx = pd.date_range("2019-01-01", periods=240, freq="H")
+    s = pd.Series(np.arange(240, dtype=float), index=idx)
+    s.iloc[10:13] = np.nan        # hueco corto -> lineal
+    s.iloc[100:180] = np.nan      # hueco largo (80 h) -> climatología
+    v, m = imputar_serie(s)
+
+    assert v.notna().all(), "quedaron huecos sin imputar"
+    assert np.allclose(v.iloc[10:13], [10, 11, 12]), "la interpolación lineal no recupera la rampa"
+    assert (m.iloc[10:13] == "interpolacion_lineal").all()
+    assert (m.iloc[100:180] == "climatologia").all(), "hueco largo no debe interpolarse linealmente"
+    assert (m.iloc[:10] == "observado").all()
+
+    df = pd.DataFrame({
+        "valor":   [CENTINELA, 10.0, 1e5, -1.0, 20.0, CENTINELA],
+        "calidad": [1.0,       1.0,  1.0, 1.0,  2.1,  3.0],
+    })
+    df = marcar_invalidos(df)
+    assert list(df.motivo) == ["faltante", "valido", "fuera_de_rango", "faltante",
+                               "no_validado", "faltante"], list(df.motivo)
+    assert df.valor_limpio.notna().sum() == 1
+    # un -9999 con la bandera tambien en mal estado se reporta como faltante,
+    # no como no_validado: gana el motivo mas especifico
+    assert df.motivo.iloc[5] == "faltante"
+
+    # un mes entero sin dato valido no puede dejar NaN: debe caer al respaldo
+    idx = pd.date_range("2019-01-01", periods=24 * 70, freq="H")
+    s2 = pd.Series(np.arange(len(idx), dtype=float), index=idx)
+    s2[s2.index.month == 2] = np.nan
+    v2, _ = imputar_serie(s2)
+    assert v2.notna().all(), "la climatologia dejo huecos cuando falta un mes entero"
+
+    assert racha_maxima(pd.Series([False, True, True, False, True])) == 2
+    print("autoprueba OK")
+
+
+# ---------------------------------------------------------------- main
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--json", default=str(JSON_POR_DEFECTO))
+    p.add_argument("--salidas", default=str(RAIZ / "salidas"))
+    p.add_argument("--nombre-json", default="08_pm25_imputado.json",
+                   help="nombre del JSON que consume app_calidad_aire.py")
+    p.add_argument("--test", action="store_true", help="corre la autoprueba y sale")
+    a = p.parse_args()
+    if a.test:
+        return autoprueba()
+
+    salidas = Path(a.salidas)
+    salidas.mkdir(parents=True, exist_ok=True)
+
+    crudo = json.loads(Path(a.json).read_text(encoding="utf-8"))
+    print("Cargando %s ..." % a.json)
+    df = cargar(a.json)
+    est = describir_estructura(df, crudo)
+    print("  %(registros)d registros, %(estaciones)d estaciones, paso %(paso_temporal)s" % est)
+
+    df = marcar_invalidos(df)
+    diag = diagnosticar(df)
+    print("Faltantes: %d | fuera de rango: %d | no validados: %d | a imputar: %d (%.2f%%)"
+          % ((df.motivo == "faltante").sum(), (df.motivo == "fuera_de_rango").sum(),
+             (df.motivo == "no_validado").sum(), (df.motivo != "valido").sum(),
+             100 * (df.motivo != "valido").mean()))
+
+    df = imputar(df)
+    val = validar_imputacion(df)
+    print("Validación imputación: MAE=%(MAE)s RMSE=%(RMSE)s R2=%(R2)s" % val)
+
+    diag.to_csv(salidas / "diagnostico_estaciones.csv", index=False, encoding="utf-8")
+    df.drop(columns=["variableConsulta"]).to_csv(
+        salidas / "pm25_imputado.csv", index=False, encoding="utf-8")
+    exportar_json(df, salidas / a.nombre_json)
+    graficar(df, diag, salidas / "graficas")
+    escribir_reporte(salidas / "reporte_calidad.md", est, diag, df, val)
+    print("Listo -> %s" % salidas)
+
+
+if __name__ == "__main__":
+    main()
